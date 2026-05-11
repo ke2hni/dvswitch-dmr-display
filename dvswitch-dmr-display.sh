@@ -1,236 +1,83 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="0.3-test"
-ROOT="/usr/share/dvswitch"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-ORIGINAL_BACKUP_DIR="$ROOT/.dvs-dashboard-dmr-display-original"
-RUN_BACKUP_DIR="$ROOT/.dvs-dashboard-dmr-display-backup-$STAMP"
-LOG_DIR="/var/log/dvs-dashboard-dmr-display"
-LOG_FILE="$LOG_DIR/dvs-dashboard-dmr-display-$STAMP.log"
+VERSION="v0.4.3-test"
+APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
+DVS_ROOT="/usr/share/dvswitch"
+STATUS_FILE="${DVS_ROOT}/include/status.php"
+TG_CACHE_FILE="${DVS_ROOT}/include/dvs-dmr-talkgroups.tsv"
+STATE_DIR="/var/lib/mmdvm/cache"
+STATE_FILE="${STATE_DIR}/dmr_last_state.json"
+ORIG_BACKUP_DIR="${DVS_ROOT}/.dvs-dashboard-dmr-display-cleanup-original"
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_BACKUP_DIR="${DVS_ROOT}/.dvs-dashboard-dmr-display-cleanup-backup-${RUN_ID}"
+LOG_FILE="/root/dvs-dashboard-dmr-display-cleanup-${RUN_ID}.log"
 
-STATUS_FILE="$ROOT/include/status.php"
-CACHE_FILE="$ROOT/include/dvs-dmr-talkgroups.tsv"
-INSTALLED_SCRIPT="/usr/local/sbin/dvswitch-dmr-display-cleanup"
-SYSTEMD_SERVICE="/etc/systemd/system/dvs-dashboard-dmr-cache-update.service"
-SYSTEMD_TIMER="/etc/systemd/system/dvs-dashboard-dmr-cache-update.timer"
-
-log(){ mkdir -p "$LOG_DIR" 2>/dev/null || true; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
-die(){ log "ERROR: $*"; exit 1; }
-
-need_root(){
-  if [ "$(id -u)" -ne 0 ]; then
-    die "Run with sudo."
-  fi
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-require_file(){
-  [ -f "$1" ] || die "Missing required file: $1"
+die() {
+    log "ERROR: $*"
+    exit 1
 }
 
-copy_files_to(){
-  dest="$1"
-  mkdir -p "$dest/include" || die "Could not create backup directory: $dest/include"
-  cp -a "$STATUS_FILE" "$dest/include/status.php" || die "Could not backup status.php"
-  if [ -f "$CACHE_FILE" ]; then
-    cp -a "$CACHE_FILE" "$dest/include/dvs-dmr-talkgroups.tsv" || die "Could not backup talkgroup cache"
-  fi
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Please run with sudo/root."
+        exit 1
+    fi
 }
 
-restore_files_from(){
-  src="$1"
-  [ -f "$src/include/status.php" ] || die "Backup missing include/status.php"
-  cp -a "$src/include/status.php" "$STATUS_FILE" || die "Could not restore status.php"
+backup_files() {
+    [ -f "$STATUS_FILE" ] || die "Missing dashboard status file: $STATUS_FILE"
 
-  if [ -f "$src/include/dvs-dmr-talkgroups.tsv" ]; then
-    cp -a "$src/include/dvs-dmr-talkgroups.tsv" "$CACHE_FILE" || die "Could not restore talkgroup cache"
-  else
-    rm -f "$CACHE_FILE"
-  fi
+    if [ ! -d "$ORIG_BACKUP_DIR" ]; then
+        log "Creating protected original dashboard backup: $ORIG_BACKUP_DIR"
+        mkdir -p "$ORIG_BACKUP_DIR" || die "Could not create protected original backup directory"
+        cp -a "$STATUS_FILE" "$ORIG_BACKUP_DIR/status.php" || die "Could not backup original status.php"
+        [ -f "$TG_CACHE_FILE" ] && cp -a "$TG_CACHE_FILE" "$ORIG_BACKUP_DIR/dvs-dmr-talkgroups.tsv"
+    else
+        log "Protected original backup already exists and will NOT be overwritten: $ORIG_BACKUP_DIR"
+    fi
+
+    log "Creating per-run backup: $RUN_BACKUP_DIR"
+    mkdir -p "$RUN_BACKUP_DIR" || die "Could not create per-run backup directory"
+    cp -a "$STATUS_FILE" "$RUN_BACKUP_DIR/status.php" || die "Could not backup status.php"
+    [ -f "$TG_CACHE_FILE" ] && cp -a "$TG_CACHE_FILE" "$RUN_BACKUP_DIR/dvs-dmr-talkgroups.tsv"
 }
 
-ensure_original_backup(){
-  if [ -d "$ORIGINAL_BACKUP_DIR" ]; then
-    log "Protected original backup already exists and will NOT be overwritten: $ORIGINAL_BACKUP_DIR"
-    return 0
-  fi
+patch_status_php() {
+    log "Applying ${APP_NAME} ${VERSION}"
+    log "Scope: DMR only. Non-DMR modes must not overwrite the DMR cache/display state."
 
-  log "Creating protected original dashboard backup: $ORIGINAL_BACKUP_DIR"
-  copy_files_to "$ORIGINAL_BACKUP_DIR"
+    mkdir -p "$STATE_DIR" || die "Could not create state directory: $STATE_DIR"
+    chown www-data:www-data "$STATE_DIR" 2>/dev/null || true
+    chmod 775 "$STATE_DIR" 2>/dev/null || true
 
-  {
-    echo "DVSwitch Dashboard DMR Display Cleanup original backup"
-    echo "Created: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "Script version: $VERSION"
-    echo "This directory is intentionally preserved and should not be overwritten by later apply runs."
-  } > "$ORIGINAL_BACKUP_DIR/README.txt" || true
-}
-
-create_run_backup(){
-  log "Creating per-run backup: $RUN_BACKUP_DIR"
-  copy_files_to "$RUN_BACKUP_DIR"
-}
-
-create_seed_cache_if_missing(){
-  if [ -f "$CACHE_FILE" ]; then
-    log "Talkgroup cache already exists: $CACHE_FILE"
-    return 0
-  fi
-
-  cat > "$CACHE_FILE" <<'EOF'
-# DVSwitch Dashboard DMR display name cache
-# Format:
-# NETWORK<TAB>ID<TAB>NAME
-#
-# Examples:
-# TGIF	31665	TGIF The Mothership
-# BM	3100	USA Nationwide
-# DMR+	4000	Disconnect
-# FreeDMR	2350	UK Calling
-# SystemX	3100	USA Nationwide
-#
-# Lookup is network + ID scoped. The same TG number can safely have different names on different networks.
-# The dashboard reads this local file only. The installer refreshes this cache immediately and installs a weekly updater timer.
-EOF
-  log "Created seed talkgroup cache: $CACHE_FILE"
-}
-
-update_cache(){
-  need_root
-  mkdir -p "$(dirname "$CACHE_FILE")" || die "Could not create cache directory"
-
-  tmp="$(mktemp)" || die "Could not create temporary file"
-
-  log "Updating local DMR talkgroup cache from current internet sources"
-  log "Cache destination: $CACHE_FILE"
-
-  python3 - "$tmp" <<'PY'
-import csv
-import html
+    python3 - "$STATUS_FILE" <<'PY'
 import re
-import sys
-import urllib.request
-from html.parser import HTMLParser
-from io import StringIO
-from pathlib import Path
-
-out_path = Path(sys.argv[1])
-rows = []
-seen = set()
-
-class TextParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.parts = []
-    def handle_data(self, data):
-        data = data.strip()
-        if data:
-            self.parts.append(data)
-
-def add(network, ident, name):
-    network = str(network).strip()
-    ident = re.sub(r'[^0-9]', '', str(ident))
-    name = html.unescape(str(name)).strip()
-    name = re.sub(r'\s+', ' ', name)
-    if not network or not ident or not name:
-        return
-    if name.lower() in {'talkgroup name', 'talkgroup', 'name'}:
-        return
-    key = (network, ident)
-    if key in seen:
-        return
-    seen.add(key)
-    rows.append((network, ident, name))
-
-def fetch(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'DVSwitch-Dashboard-DMR-Display/0.2'})
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return r.read().decode('utf-8', 'replace')
-
-def parse_csv(network, url):
-    data = fetch(url)
-    sample = data[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample)
-    except Exception:
-        dialect = csv.excel
-    reader = csv.reader(StringIO(data), dialect)
-    for row in reader:
-        if len(row) < 2:
-            continue
-        first = row[0].strip()
-        second = row[1].strip()
-        if not re.search(r'\d', first):
-            continue
-        add(network, first, second)
-
-def parse_w0chp_page(network, url):
-    data = fetch(url)
-    parser = TextParser()
-    parser.feed(data)
-    tokens = parser.parts
-
-    # W0CHP pages render as alternating "number" then "name" tokens.
-    for i, token in enumerate(tokens[:-1]):
-        if re.fullmatch(r'\d{1,9}', token):
-            nxt = tokens[i + 1]
-            if not re.fullmatch(r'[↑↓| ]+', nxt) and not nxt.lower().startswith('document version'):
-                add(network, token, nxt)
-
-sources = [
-    ('TGIF', 'csv', 'https://api.tgif.network/dmr/talkgroups/csv'),
-    ('BM', 'html', 'https://w0chp.radio/digital-radio-lists/brandmeister-talkgroups/'),
-    ('FreeDMR', 'html', 'https://w0chp.radio/digital-radio-lists/freedmr-talkgroups/'),
-    ('DMR+', 'html', 'https://w0chp.radio/digital-radio-lists/dmrplus-talkgroups/'),
-    ('SystemX', 'html', 'https://w0chp.radio/digital-radio-lists/system-x-talkgroups/'),
-]
-
-errors = []
-for network, kind, url in sources:
-    before = len(rows)
-    try:
-        if kind == 'csv':
-            parse_csv(network, url)
-        else:
-            parse_w0chp_page(network, url)
-        print(f"OK: {network}: added {len(rows) - before} entries from {url}")
-    except Exception as e:
-        errors.append(f"WARNING: {network}: {e}")
-        print(errors[-1])
-
-with out_path.open('w', encoding='utf-8') as f:
-    f.write('# DVSwitch Dashboard DMR display name cache\n')
-    f.write('# Generated by dvswitch-dmr-display-cleanup.sh\n')
-    f.write('# Format: NETWORK<TAB>ID<TAB>NAME\n')
-    f.write('# Lookup is network + ID scoped.\n')
-    for network, ident, name in sorted(rows, key=lambda x: (x[0], int(x[1]))):
-        f.write(f'{network}\t{ident}\t{name}\n')
-
-if not rows:
-    raise SystemExit('No talkgroup entries were downloaded; refusing to replace cache')
-PY
-
-  [ -s "$tmp" ] || die "Generated cache is empty"
-  cp -a "$tmp" "$CACHE_FILE" || die "Could not install updated cache"
-  rm -f "$tmp"
-  chmod 0644 "$CACHE_FILE" || true
-  log "Updated talkgroup cache: $CACHE_FILE"
-  log "Cache entry count: $(grep -cv '^#\|^$' "$CACHE_FILE" 2>/dev/null || echo 0)"
-  log "Log file: $LOG_FILE"
-}
-
-patch_status_php(){
-  python3 - "$STATUS_FILE" <<'PY'
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text()
-marker = "// DVS-DMR-DISPLAY-CLEANUP v0.2-test"
 
-helper = r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.2-test
+if "DVS-DMR-DISPLAY-CLEANUP v0.4.3-test" in text:
+    print("status.php already contains v0.4.3 marker")
+    sys.exit(0)
+
+block = r'''// DVS-DMR-DISPLAY-CLEANUP v0.4.3-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
+// DMR state is updated ONLY when ABInfo reports ambe_mode=DMR.
+// Non-DMR modes keep showing the last valid DMR network/TG/name.
+
+if (!function_exists('dvs_dmr_display_state_file')) {
+    function dvs_dmr_display_state_file() {
+        return '/var/lib/mmdvm/cache/dmr_last_state.json';
+    }
+}
+
 if (!function_exists('dvs_dmr_display_network_key')) {
     function dvs_dmr_display_network_key($dmrMasterHost) {
         $s = strtoupper(str_replace('_', ' ', (string)$dmrMasterHost));
@@ -243,8 +90,18 @@ if (!function_exists('dvs_dmr_display_network_key')) {
     }
 }
 
-if (!function_exists('dvs_dmr_display_current_tg')) {
-    function dvs_dmr_display_current_tg($abinfo) {
+if (!function_exists('dvs_dmr_display_is_live_dmr')) {
+    function dvs_dmr_display_is_live_dmr($abinfo) {
+        $mode = '';
+        if (isset($abinfo['tlv']['ambe_mode'])) {
+            $mode = trim((string)$abinfo['tlv']['ambe_mode']);
+        }
+        return strtoupper($mode) === 'DMR';
+    }
+}
+
+if (!function_exists('dvs_dmr_display_extract_live_tg')) {
+    function dvs_dmr_display_extract_live_tg($abinfo) {
         $tg = isset($abinfo['digital']['tg']) ? trim((string)$abinfo['digital']['tg']) : '';
         if (preg_match('/^\d+$/', $tg)) { return $tg; }
 
@@ -281,6 +138,86 @@ if (!function_exists('dvs_dmr_display_lookup_name')) {
     }
 }
 
+if (!function_exists('dvs_dmr_display_read_state')) {
+    function dvs_dmr_display_read_state() {
+        $file = dvs_dmr_display_state_file();
+        if (!is_readable($file)) { return array(); }
+
+        $raw = file_get_contents($file);
+        if ($raw === false || trim($raw) === '') { return array(); }
+
+        $data = json_decode($raw, true);
+        if (!is_array($data)) { return array(); }
+
+        return $data;
+    }
+}
+
+if (!function_exists('dvs_dmr_display_write_state')) {
+    function dvs_dmr_display_write_state($state) {
+        $file = dvs_dmr_display_state_file();
+        $dir = dirname($file);
+
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+
+        if (!is_dir($dir) || !is_writable($dir)) {
+            return false;
+        }
+
+        $payload = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($payload === false) { return false; }
+
+        $tmp = $file . '.tmp';
+        if (@file_put_contents($tmp, $payload . "\n", LOCK_EX) === false) {
+            return false;
+        }
+
+        @chmod($tmp, 0664);
+        return @rename($tmp, $file);
+    }
+}
+
+if (!function_exists('dvs_dmr_display_current_state')) {
+    function dvs_dmr_display_current_state($dmrMasterHost, $abinfo) {
+        $stored = dvs_dmr_display_read_state();
+
+        if (!dvs_dmr_display_is_live_dmr($abinfo)) {
+            return $stored;
+        }
+
+        $network = dvs_dmr_display_network_key($dmrMasterHost);
+        $tg = dvs_dmr_display_extract_live_tg($abinfo);
+
+        if ($network === 'DMR' || $tg === '') {
+            return $stored;
+        }
+
+        $name = dvs_dmr_display_lookup_name($network, $tg);
+        $state = array(
+            'network' => $network,
+            'tg' => $tg,
+            'name' => $name,
+            'master' => (string)$dmrMasterHost,
+            'updated' => date('c')
+        );
+
+        dvs_dmr_display_write_state($state);
+        return $state;
+    }
+}
+
+if (!function_exists('dvs_dmr_display_current_tg')) {
+    function dvs_dmr_display_current_tg($abinfo) {
+        if (!dvs_dmr_display_is_live_dmr($abinfo)) {
+            $state = dvs_dmr_display_read_state();
+            return isset($state['tg']) ? trim((string)$state['tg']) : '';
+        }
+        return dvs_dmr_display_extract_live_tg($abinfo);
+    }
+}
+
 if (!function_exists('dvs_dmr_display_mode_label')) {
     function dvs_dmr_display_mode_label($ambeMode, $dmrMasterHost) {
         if (strtoupper((string)$ambeMode) !== 'DMR') {
@@ -292,14 +229,16 @@ if (!function_exists('dvs_dmr_display_mode_label')) {
 
 if (!function_exists('dvs_dmr_display_master_label')) {
     function dvs_dmr_display_master_label($dmrMasterHost, $abinfo) {
-        $network = dvs_dmr_display_network_key($dmrMasterHost);
-        $tg = dvs_dmr_display_current_tg($abinfo);
+        $state = dvs_dmr_display_current_state($dmrMasterHost, $abinfo);
 
-        if ($network === 'DMR' || $tg === '') {
+        $network = isset($state['network']) ? trim((string)$state['network']) : '';
+        $tg = isset($state['tg']) ? trim((string)$state['tg']) : '';
+        $name = isset($state['name']) ? trim((string)$state['name']) : '';
+
+        if ($network === '' || $tg === '') {
             return htmlspecialchars((string)$dmrMasterHost, ENT_QUOTES, 'UTF-8');
         }
 
-        $name = dvs_dmr_display_lookup_name($network, $tg);
         if ($name !== '') {
             return htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
         }
@@ -309,201 +248,132 @@ if (!function_exists('dvs_dmr_display_master_label')) {
 }
 '''
 
-if marker not in text:
-    needle = "include_once dirname(dirname(__FILE__)).'/include/functions.php';\n"
-    if needle not in text:
-        raise SystemExit('Could not find functions.php include marker in status.php')
-    text = text.replace(needle, needle + helper + "\n", 1)
+pattern = re.compile(
+    r"// DVS-DMR-DISPLAY-CLEANUP v[0-9.]+-test\s*"
+    r"// Display-only helpers\. No tuning, routing, startup TG, or network config is changed\.\s*"
+    r".*?\n\s*\?>\s*\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>",
+    re.S
+)
 
-old_mode = 'echo "<tr><th width=50%>Mode</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">".$abinfo[\'tlv\'][\'ambe_mode\']."</td></tr>\\n";'
-new_mode = 'echo "<tr><th width=50%>Mode</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">".dvs_dmr_display_mode_label($abinfo[\'tlv\'][\'ambe_mode\'], $dmrMasterHost)."</td></tr>\\n";'
+replacement = block + "\n\n?>\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>"
 
-mode_count = text.count(old_mode)
-if mode_count == 0 and new_mode not in text:
-    raise SystemExit('Could not find Analog Bridge Mode output line in status.php')
-text = text.replace(old_mode, new_mode)
+new_text, count = pattern.subn(lambda m: replacement, text, count=1)
+if count != 1:
+    print("Could not locate existing DMR display helper block in status.php")
+    sys.exit(2)
 
-old_master = 'echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".$dmrMasterHost."</span></td></tr>\\n";}'
-new_master = 'echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".dvs_dmr_display_master_label($dmrMasterHost, $abinfo)."</span></td></tr>\\n";}'
-
-if old_master not in text and new_master not in text:
-    raise SystemExit('Could not find direct DMR Master output line in status.php')
-text = text.replace(old_master, new_master, 1)
-
-path.write_text(text)
+path.write_text(new_text)
+print("Patched status.php DMR helper block to v0.4.3")
 PY
+    rc=$?
+    [ "$rc" -eq 0 ] || die "Could not patch status.php cleanly"
+
+    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1 || {
+        cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
+        die "PHP syntax check failed for status.php"
+    }
+
+    log "PHP syntax check passed for status.php"
+    log "Patched status.php DMR helper logic: DMR state updates now require ABInfo ambe_mode=DMR."
+    log "When mode is YSF/P25/NXDN/STFU/D-Star, the DMR Master box should keep the last valid DMR TG/name."
+    log "DMR state file: $STATE_FILE"
 }
 
-install_weekly_cache_timer(){
-  need_root
+restore_latest_backup() {
+    latest="$(find "$DVS_ROOT" -maxdepth 1 -type d -name '.dvs-dashboard-dmr-display-cleanup-backup-*' | sort | tail -1)"
+    [ -n "$latest" ] || die "No per-run backup found"
+    [ -f "$latest/status.php" ] || die "Latest backup missing status.php: $latest"
 
-  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    cp -a "${BASH_SOURCE[0]}" "$INSTALLED_SCRIPT" || die "Could not install helper script to $INSTALLED_SCRIPT"
-    chmod 755 "$INSTALLED_SCRIPT" || die "Could not chmod $INSTALLED_SCRIPT"
-    log "Installed updater/helper script: $INSTALLED_SCRIPT"
-  else
-    die "Could not locate running script for installation"
-  fi
-
-  cat > "$SYSTEMD_SERVICE" <<EOF
-[Unit]
-Description=DVSwitch Dashboard DMR talkgroup name cache update
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$INSTALLED_SCRIPT --update-cache
-EOF
-
-  cat > "$SYSTEMD_TIMER" <<'EOF'
-[Unit]
-Description=Weekly DVSwitch Dashboard DMR talkgroup name cache update
-
-[Timer]
-OnCalendar=Sun *-*-* 03:25:00
-Persistent=true
-RandomizedDelaySec=30m
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload || die "systemctl daemon-reload failed"
-  systemctl enable --now "$(basename "$SYSTEMD_TIMER")" || die "Could not enable weekly cache update timer"
-  log "Installed and enabled weekly cache update timer: $(basename "$SYSTEMD_TIMER")"
+    log "Restoring latest per-run backup: $latest"
+    cp -a "$latest/status.php" "$STATUS_FILE" || die "Could not restore status.php"
+    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1 || {
+        cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
+        die "PHP syntax check failed after restore"
+    }
+    log "Restore latest per-run backup completed"
 }
 
-remove_weekly_cache_timer(){
-  need_root
+restore_original() {
+    [ -f "$ORIG_BACKUP_DIR/status.php" ] || die "Protected original backup missing status.php: $ORIG_BACKUP_DIR"
 
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$(basename "$SYSTEMD_TIMER")" >/dev/null 2>&1 || true
-    rm -f "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl reset-failed "$(basename "$SYSTEMD_SERVICE")" "$(basename "$SYSTEMD_TIMER")" >/dev/null 2>&1 || true
-  else
-    rm -f "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER"
-  fi
-
-  rm -f "$INSTALLED_SCRIPT"
-  log "Removed weekly cache updater service/timer and installed helper script."
+    log "Restoring protected original dashboard file backup: $ORIG_BACKUP_DIR"
+    cp -a "$ORIG_BACKUP_DIR/status.php" "$STATUS_FILE" || die "Could not restore original status.php"
+    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1 || {
+        cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
+        die "PHP syntax check failed after original restore"
+    }
+    log "Restore protected original files completed"
 }
 
-apply_patch(){
-  need_root
-  require_file "$STATUS_FILE"
-
-  ensure_original_backup
-  create_run_backup
-  create_seed_cache_if_missing
-
-  log "Applying DVSwitch Dashboard DMR display cleanup v$VERSION"
-  log "Scope: display only; status.php only; no tuning/config/routing changes."
-
-  update_cache
-  install_weekly_cache_timer
-  patch_status_php
-
-  log "Patched status.php."
-  log "Analog Bridge Info Mode displays DMR network label when ambe_mode is DMR."
-  log "Direct DMR Master box displays talkgroup name from network+TG cache when available."
-  log "Protected original backup: $ORIGINAL_BACKUP_DIR"
-  log "Per-run backup: $RUN_BACKUP_DIR"
-  log "Talkgroup cache: $CACHE_FILE"
-  log "Weekly cache updater: $(basename "$SYSTEMD_TIMER")"
-  log "Refresh the DVSwitch Dashboard in the browser."
-  log "Log file: $LOG_FILE"
+show_status() {
+    echo
+    echo "${APP_NAME} ${VERSION} status"
+    echo "Dashboard root: $DVS_ROOT"
+    echo "Status file:    $STATUS_FILE"
+    echo "State file:     $STATE_FILE"
+    echo
+    echo "Markers in status.php:"
+    grep -n "DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_current_state\|dvs_dmr_display_is_live_dmr\|dvs_dmr_display_state_file" "$STATUS_FILE" 2>/dev/null || true
+    echo
+    echo "Current DMR state file:"
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    else
+        echo "(not created yet)"
+    fi
+    echo
+    echo "Protected original backup:"
+    if [ -d "$ORIG_BACKUP_DIR" ]; then
+        echo "$ORIG_BACKUP_DIR"
+    else
+        echo "(not created yet)"
+    fi
+    echo
+    echo "Latest per-run backup:"
+    find "$DVS_ROOT" -maxdepth 1 -type d -name '.dvs-dashboard-dmr-display-cleanup-backup-*' | sort | tail -1
 }
 
-restore_latest(){
-  need_root
-  latest="$(find "$ROOT" -maxdepth 1 -type d -name '.dvs-dashboard-dmr-display-backup-*' | sort | tail -n 1)"
-  [ -n "$latest" ] || die "No per-run DMR display backup directory found in $ROOT"
-  restore_files_from "$latest"
-  log "Restored dashboard files from latest per-run backup: $latest"
-  log "Protected original backup was not changed: $ORIGINAL_BACKUP_DIR"
-  log "Log file: $LOG_FILE"
-}
-
-restore_original(){
-  need_root
-  [ -d "$ORIGINAL_BACKUP_DIR" ] || die "Protected original backup does not exist: $ORIGINAL_BACKUP_DIR"
-  restore_files_from "$ORIGINAL_BACKUP_DIR"
-  log "Restored dashboard files from protected original backup: $ORIGINAL_BACKUP_DIR"
-  log "This should return tracked files to their pre-DMR-display-patch state."
-  log "Log file: $LOG_FILE"
-}
-
-show_status(){
-  echo "DVSwitch Dashboard DMR Display Cleanup v$VERSION"
-  echo
-  echo "Tracked files:"
-  echo "  $STATUS_FILE"
-  echo "  $CACHE_FILE"
-  echo "  $LOG_DIR"
-  echo
-  if [ -d "$ORIGINAL_BACKUP_DIR" ]; then
-    echo "Protected original backup: FOUND"
-    echo "  $ORIGINAL_BACKUP_DIR"
-  else
-    echo "Protected original backup: NOT FOUND"
-  fi
-  echo
-  echo "Current patch markers:"
-  grep -Hn 'DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_mode_label\|dvs_dmr_display_master_label' "$STATUS_FILE" 2>/dev/null || true
-  echo
-  if [ -f "$CACHE_FILE" ]; then
-    echo "Talkgroup cache: FOUND"
-    echo "  $CACHE_FILE"
-    echo "Cache entries: $(grep -cv '^#\|^$' "$CACHE_FILE" 2>/dev/null || echo 0)"
-  else
-    echo "Talkgroup cache: NOT FOUND"
-  fi
-  echo
-  if [ -f "$SYSTEMD_TIMER" ]; then
-    echo "Weekly cache updater: INSTALLED"
-    systemctl is-enabled "$(basename "$SYSTEMD_TIMER")" 2>/dev/null | sed 's/^/  Enabled: /' || true
-    systemctl is-active "$(basename "$SYSTEMD_TIMER")" 2>/dev/null | sed 's/^/  Active: /' || true
-  else
-    echo "Weekly cache updater: NOT INSTALLED"
-  fi
-}
-
-case "${1:-menu}" in
-  apply|--apply)
-    apply_patch
-    ;;
-  update-cache|--update-cache)
-    update_cache
-    ;;
-  restore-latest|--restore-latest)
-    restore_latest
-    ;;
-  restore-original|restore-factory|--restore-original|--restore-factory)
-    restore_original
-    ;;
-  status|--status)
-    show_status
-    ;;
-  *)
-    echo "DVSwitch Dashboard DMR Display Cleanup v$VERSION"
-    echo "1 = Apply DMR display cleanup, build cache, and install weekly cache updater"
+main_menu() {
+    echo "${APP_NAME} ${VERSION}"
+    echo "1 = Apply DMR display cleanup fix"
     echo "2 = Restore latest per-run backup"
     echo "3 = Restore protected original files"
-    echo "4 = Show DMR-display status markers"
-    echo "5 = Update local talkgroup name cache from internet now"
+    echo "4 = Show DMR cleanup status markers"
     echo "0 = Exit"
-    printf "Choose an action [0/1/2/3/4/5]: "
+    printf "Choose an action [0/1/2/3/4]: "
     read -r choice
+
     case "$choice" in
-      1) apply_patch ;;
-      2) restore_latest ;;
-      3) restore_original ;;
-      4) show_status ;;
-      5) update_cache ;;
-      0) exit 0 ;;
-      *) die "Invalid choice" ;;
+        1)
+            backup_files
+            patch_status_php
+            log "Protected original backup: $ORIG_BACKUP_DIR"
+            log "Per-run backup: $RUN_BACKUP_DIR"
+            log "DMR state file: $STATE_FILE"
+            log "Refresh the DVSwitch Dashboard in the browser."
+            log "Log file: $LOG_FILE"
+            ;;
+        2)
+            restore_latest_backup
+            log "Log file: $LOG_FILE"
+            ;;
+        3)
+            restore_original
+            log "Log file: $LOG_FILE"
+            ;;
+        4)
+            show_status | tee -a "$LOG_FILE"
+            log "Log file: $LOG_FILE"
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo "Invalid choice."
+            exit 1
+            ;;
     esac
-    ;;
-esac
+}
+
+need_root
+main_menu
