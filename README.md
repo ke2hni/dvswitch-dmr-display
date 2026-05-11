@@ -307,3 +307,4 @@ Always test on a non-production node first.
 <p align="center">
   📡 Built to modernize DVSwitch Dashboard display readability safely without breaking upstream behavior
 </p>
+<img width="1600" height="900" alt="Screenshot 2026-05-10 225632" src="https://github.com/user-attachments/assets/dbd43c79-2572-4aca-9856-50ea3b37aa80" />
