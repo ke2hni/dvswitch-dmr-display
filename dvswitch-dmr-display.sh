@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.6-test"
+VERSION="v0.4.7-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -13,20 +13,18 @@ RUN_ID="$(date +%Y%m%d-%H%M%S)"
 RUN_BACKUP_DIR="${DVS_ROOT}/.dvs-dashboard-dmr-display-cleanup-backup-${RUN_ID}"
 LOG_FILE="/root/dvs-dashboard-dmr-display-cleanup-${RUN_ID}.log"
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
-}
-
-die() {
-    log "ERROR: $*"
-    exit 1
-}
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+die() { log "ERROR: $*"; exit 1; }
 
 need_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "Please run with sudo/root."
         exit 1
     fi
+}
+
+lint_status() {
+    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1
 }
 
 backup_files() {
@@ -37,6 +35,16 @@ backup_files() {
         mkdir -p "$ORIG_BACKUP_DIR" || die "Could not create protected original backup directory"
         cp -a "$STATUS_FILE" "$ORIG_BACKUP_DIR/status.php" || die "Could not backup original status.php"
         [ -f "$TG_CACHE_FILE" ] && cp -a "$TG_CACHE_FILE" "$ORIG_BACKUP_DIR/dvs-dmr-talkgroups.tsv"
+    elif [ ! -f "$ORIG_BACKUP_DIR/status.php" ]; then
+        log "WARNING: Protected original backup directory exists but status.php is missing."
+        if lint_status; then
+            log "Repairing missing protected status.php backup from the current lint-clean status.php."
+            cp -a "$STATUS_FILE" "$ORIG_BACKUP_DIR/status.php" || die "Could not repair missing protected original status.php backup"
+            [ -f "$TG_CACHE_FILE" ] && cp -a "$TG_CACHE_FILE" "$ORIG_BACKUP_DIR/dvs-dmr-talkgroups.tsv"
+        else
+            cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
+            die "Current status.php is not lint-clean; refusing to repair protected backup"
+        fi
     else
         log "Protected original backup already exists and will NOT be overwritten: $ORIG_BACKUP_DIR"
     fi
@@ -47,9 +55,17 @@ backup_files() {
     [ -f "$TG_CACHE_FILE" ] && cp -a "$TG_CACHE_FILE" "$RUN_BACKUP_DIR/dvs-dmr-talkgroups.tsv"
 }
 
+restore_run_backup_now() {
+    if [ -f "$RUN_BACKUP_DIR/status.php" ]; then
+        cp -a "$RUN_BACKUP_DIR/status.php" "$STATUS_FILE" || true
+        log "Auto-restored status.php from this run backup after failure: $RUN_BACKUP_DIR"
+    fi
+}
+
 patch_status_php() {
     log "Applying ${APP_NAME} ${VERSION}"
     log "Scope: DMR only. Non-DMR modes must not overwrite the DMR cache/display state."
+    log "Patch strategy: install helper block, then safely override display variables before stock rows render."
 
     mkdir -p "$STATE_DIR" || die "Could not create state directory: $STATE_DIR"
     chown www-data:www-data "$STATE_DIR" 2>/dev/null || true
@@ -63,14 +79,16 @@ from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
 
-if "DVS-DMR-DISPLAY-CLEANUP v0.4.6-test" in text:
-    print("status.php already contains v0.4.6 marker")
-    sys.exit(0)
+version = "v0.4.7-test"
+start_marker = "// DVS-DMR-DISPLAY-CLEANUP START"
+end_marker = "// DVS-DMR-DISPLAY-CLEANUP END"
 
-block = r'''// DVS-DMR-DISPLAY-CLEANUP v0.4.6-test
+block = r'''// DVS-DMR-DISPLAY-CLEANUP START
+// DVS-DMR-DISPLAY-CLEANUP v0.4.7-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state is updated ONLY when ABInfo reports ambe_mode=DMR.
-// Non-DMR modes keep showing the last valid DMR network/TG/name.
+// Non-DMR modes keep the last valid DMR network/TG/name.
+// v0.4.7 avoids fragile HTML-row rewriting by overriding stock display variables before render.
 
 if (!function_exists('dvs_dmr_display_state_file')) {
     function dvs_dmr_display_state_file() {
@@ -90,22 +108,10 @@ if (!function_exists('dvs_dmr_display_network_key')) {
     }
 }
 
-if (!function_exists('dvs_dmr_display_safe_master')) {
-    function dvs_dmr_display_safe_master() {
-        if (function_exists('getDMRMaster')) {
-            $master = getDMRMaster();
-            if (is_string($master) && trim($master) !== '') {
-                return trim($master);
-            }
-        }
-        return '';
-    }
-}
-
 if (!function_exists('dvs_dmr_display_is_live_dmr')) {
     function dvs_dmr_display_is_live_dmr($abinfo) {
         $mode = '';
-        if (isset($abinfo['tlv']['ambe_mode'])) {
+        if (is_array($abinfo) && isset($abinfo['tlv']['ambe_mode'])) {
             $mode = trim((string)$abinfo['tlv']['ambe_mode']);
         }
         return strtoupper($mode) === 'DMR';
@@ -114,10 +120,10 @@ if (!function_exists('dvs_dmr_display_is_live_dmr')) {
 
 if (!function_exists('dvs_dmr_display_extract_live_tg')) {
     function dvs_dmr_display_extract_live_tg($abinfo) {
-        $tg = isset($abinfo['digital']['tg']) ? trim((string)$abinfo['digital']['tg']) : '';
+        $tg = is_array($abinfo) && isset($abinfo['digital']['tg']) ? trim((string)$abinfo['digital']['tg']) : '';
         if (preg_match('/^\d+$/', $tg)) { return $tg; }
 
-        $lastTune = isset($abinfo['last_tune']) ? trim((string)$abinfo['last_tune']) : '';
+        $lastTune = is_array($abinfo) && isset($abinfo['last_tune']) ? trim((string)$abinfo['last_tune']) : '';
         if (preg_match('/^TG\s*(\d+)$/i', $lastTune, $m)) { return $m[1]; }
         if (preg_match('/^\d+$/', $lastTune)) { return $lastTune; }
 
@@ -220,27 +226,17 @@ if (!function_exists('dvs_dmr_display_current_state')) {
     }
 }
 
-if (!function_exists('dvs_dmr_display_current_tg')) {
-    function dvs_dmr_display_current_tg($abinfo) {
-        if (!dvs_dmr_display_is_live_dmr($abinfo)) {
-            $state = dvs_dmr_display_read_state();
-            return isset($state['tg']) ? trim((string)$state['tg']) : '';
-        }
-        return dvs_dmr_display_extract_live_tg($abinfo);
-    }
-}
-
-if (!function_exists('dvs_dmr_display_mode_label')) {
-    function dvs_dmr_display_mode_label($ambeMode, $dmrMasterHost) {
+if (!function_exists('dvs_dmr_display_mode_plain')) {
+    function dvs_dmr_display_mode_plain($ambeMode, $dmrMasterHost) {
         if (strtoupper((string)$ambeMode) !== 'DMR') {
-            return htmlspecialchars((string)$ambeMode, ENT_QUOTES, 'UTF-8');
+            return (string)$ambeMode;
         }
-        return htmlspecialchars(dvs_dmr_display_network_key($dmrMasterHost), ENT_QUOTES, 'UTF-8');
+        return dvs_dmr_display_network_key($dmrMasterHost);
     }
 }
 
-if (!function_exists('dvs_dmr_display_master_label')) {
-    function dvs_dmr_display_master_label($dmrMasterHost, $abinfo) {
+if (!function_exists('dvs_dmr_display_master_plain')) {
+    function dvs_dmr_display_master_plain($dmrMasterHost, $abinfo) {
         $state = dvs_dmr_display_current_state($dmrMasterHost, $abinfo);
 
         $network = isset($state['network']) ? trim((string)$state['network']) : '';
@@ -248,91 +244,77 @@ if (!function_exists('dvs_dmr_display_master_label')) {
         $name = isset($state['name']) ? trim((string)$state['name']) : '';
 
         if ($network === '' || $tg === '') {
-            return htmlspecialchars((string)$dmrMasterHost, ENT_QUOTES, 'UTF-8');
+            return (string)$dmrMasterHost;
         }
 
         if ($name !== '') {
-            return htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
+            return $name;
         }
 
-        return htmlspecialchars('TG ' . $tg, ENT_QUOTES, 'UTF-8');
+        return 'TG ' . $tg;
     }
 }
+
+// Safe stock-display variable override. This avoids editing the dashboard HTML rows.
+if (isset($abinfo) && is_array($abinfo) && isset($dmrMasterHost)) {
+    $__dvs_dmr_display_original_master = $dmrMasterHost;
+    $__dvs_dmr_display_original_mode = isset($abinfo['tlv']['ambe_mode']) ? $abinfo['tlv']['ambe_mode'] : '';
+    $__dvs_dmr_display_master_label = dvs_dmr_display_master_plain($__dvs_dmr_display_original_master, $abinfo);
+    $__dvs_dmr_display_mode_label = dvs_dmr_display_mode_plain($__dvs_dmr_display_original_mode, $__dvs_dmr_display_original_master);
+
+    $dmrMasterHost = htmlspecialchars($__dvs_dmr_display_master_label, ENT_QUOTES, 'UTF-8');
+    if (!isset($abinfo['tlv']) || !is_array($abinfo['tlv'])) { $abinfo['tlv'] = array(); }
+    $abinfo['tlv']['ambe_mode'] = htmlspecialchars($__dvs_dmr_display_mode_label, ENT_QUOTES, 'UTF-8');
+}
+// DVS-DMR-DISPLAY-CLEANUP END
 '''
 
-anchor_re = re.compile(r"\?>\s*\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>")
-old_block_re = re.compile(
-    r"// DVS-DMR-DISPLAY-CLEANUP v[^\n]*\n"
-    r"// Display-only helpers\. No tuning, routing, startup TG, or network config is changed\.\n"
-    r".*?(?=\n\s*\?>\s*\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>)",
-    re.S
+# Remove any previous helper block, including older versions that did not have START/END.
+text2, count = re.subn(
+    r"// DVS-DMR-DISPLAY-CLEANUP START\s*.*?// DVS-DMR-DISPLAY-CLEANUP END\s*",
+    "",
+    text,
+    flags=re.S,
 )
+text = text2
 
-def patch_visible_rows(src):
-    mode_php = "<?php echo dvs_dmr_display_mode_label((isset($abinfo['tlv']['ambe_mode']) ? $abinfo['tlv']['ambe_mode'] : ''), dvs_dmr_display_safe_master()); ?>"
-    master_php = "<?php echo dvs_dmr_display_master_label(dvs_dmr_display_safe_master(), $abinfo); ?>"
+text2, old_count = re.subn(
+    r"// DVS-DMR-DISPLAY-CLEANUP v[0-9.]+-test\s*"
+    r"// Display-only helpers\. No tuning, routing, startup TG, or network config is changed\.\s*"
+    r".*?(?=\n\?>\s*\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>)",
+    "",
+    text,
+    count=1,
+    flags=re.S,
+)
+text = text2
 
-    changes = []
+# Insert the helper immediately before the Status HTML begins, which is where the stock variables are already available.
+anchor = '\n?>\n<span style="font-weight: bold;font-size:14px;">Status</span>'
+if anchor not in text:
+    print("Could not find stock Status anchor in status.php")
+    sys.exit(2)
 
-    mode_re = re.compile(r'(<tr>\s*<th[^>]*>\s*Mode\s*</th>\s*<td[^>]*>).*?(</td>\s*</tr>)', re.S | re.I)
-    src, n = mode_re.subn(lambda m: m.group(1) + mode_php + m.group(2), src, count=1)
-    if n:
-        changes.append('Mode row')
-
-    # Stock DVSwitch commonly renders DMR Master as a header row followed by a single value row.
-    master_re = re.compile(r'(<tr>\s*<th[^>]*>\s*DMR\s+Master\s*</th>\s*</tr>\s*<tr>\s*<td[^>]*>).*?(</td>\s*</tr>)', re.S | re.I)
-    src, n = master_re.subn(lambda m: m.group(1) + master_php + m.group(2), src, count=1)
-    if n:
-        changes.append('DMR Master value row')
-    else:
-        # Fallback for variants that place label and value in the same row.
-        master_inline_re = re.compile(r'(<tr>\s*<th[^>]*>\s*DMR\s+Master\s*</th>\s*<td[^>]*>).*?(</td>\s*</tr>)', re.S | re.I)
-        src, n = master_inline_re.subn(lambda m: m.group(1) + master_php + m.group(2), src, count=1)
-        if n:
-            changes.append('DMR Master inline row')
-
-    return src, changes
-
-# Case 1: upgrade/replace an existing DMR display cleanup helper block.
-new_text, count = old_block_re.subn(lambda m: block, text, count=1)
-if count == 1:
-    new_text, display_changes = patch_visible_rows(new_text)
-    path.write_text(new_text)
-    print("Replaced existing DMR display helper block with v0.4.6")
-    if display_changes:
-        print("Patched visible dashboard rows: " + ", ".join(display_changes))
-    else:
-        print("WARNING: Helper block updated, but visible Mode/DMR Master rows were not found")
-    sys.exit(0)
-
-# Case 2: clean/factory status.php or restored original: insert the helper block
-# immediately before the stock PHP close + Status label anchor.
-new_text, count = anchor_re.subn(lambda m: block + "\n\n?>\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>", text, count=1)
-if count == 1:
-    new_text, display_changes = patch_visible_rows(new_text)
-    path.write_text(new_text)
-    print("Inserted DMR display helper block v0.4.6 before Status label")
-    if display_changes:
-        print("Patched visible dashboard rows: " + ", ".join(display_changes))
-    else:
-        print("WARNING: Helper block inserted, but visible Mode/DMR Master rows were not found")
-    sys.exit(0)
-
-print("Could not find the stock Status label anchor in status.php")
-print("Expected anchor: ?> followed by <span style=\"font-weight: bold;font-size:14px;\">Status</span>")
-sys.exit(2)
+text = text.replace(anchor, "\n" + block + anchor, 1)
+path.write_text(text)
+print(f"Installed DMR display helper block {version}; removed newer/older helper blocks first")
+print("Patched strategy: no direct HTML row rewrite; stock variables are overridden safely before render")
 PY
     rc=$?
-    [ "$rc" -eq 0 ] || die "Could not patch status.php cleanly"
+    if [ "$rc" -ne 0 ]; then
+        restore_run_backup_now
+        die "Could not patch status.php cleanly"
+    fi
 
-    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1 || {
+    if ! lint_status; then
         cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
-        die "PHP syntax check failed for status.php"
-    }
+        restore_run_backup_now
+        die "PHP syntax check failed for status.php; restored this run backup"
+    fi
 
     log "PHP syntax check passed for status.php"
-    log "Patched status.php DMR helper logic and visible Mode/DMR Master rows."
-    log "When mode is YSF/P25/NXDN/STFU/D-Star, the DMR Master box should keep the last valid DMR TG/name."
+    log "Installed helper block and safe display-variable override."
+    log "Expected visible result in DMR: Mode should show TGIF/BM/etc.; DMR Master should show TG name or TG number."
     log "DMR state file: $STATE_FILE"
 }
 
@@ -343,10 +325,10 @@ restore_latest_backup() {
 
     log "Restoring latest per-run backup: $latest"
     cp -a "$latest/status.php" "$STATUS_FILE" || die "Could not restore status.php"
-    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1 || {
+    if ! lint_status; then
         cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
         die "PHP syntax check failed after restore"
-    }
+    fi
     log "Restore latest per-run backup completed"
 }
 
@@ -355,10 +337,10 @@ restore_original() {
 
     log "Restoring protected original dashboard file backup: $ORIG_BACKUP_DIR"
     cp -a "$ORIG_BACKUP_DIR/status.php" "$STATUS_FILE" || die "Could not restore original status.php"
-    php -l "$STATUS_FILE" >/tmp/dvs_dmr_php_lint_status.out 2>&1 || {
+    if ! lint_status; then
         cat /tmp/dvs_dmr_php_lint_status.out | tee -a "$LOG_FILE"
         die "PHP syntax check failed after original restore"
-    }
+    fi
     log "Restore protected original files completed"
 }
 
@@ -370,7 +352,7 @@ show_status() {
     echo "State file:     $STATE_FILE"
     echo
     echo "Markers in status.php:"
-    grep -n "DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_current_state\|dvs_dmr_display_is_live_dmr\|dvs_dmr_display_state_file\|dvs_dmr_display_master_label\|dvs_dmr_display_mode_label" "$STATUS_FILE" 2>/dev/null || true
+    grep -n "DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_current_state\|dvs_dmr_display_is_live_dmr\|dvs_dmr_display_state_file\|dvs_dmr_display_mode_plain\|dvs_dmr_display_master_plain" "$STATUS_FILE" 2>/dev/null || true
     echo
     echo "Current DMR state file:"
     if [ -f "$STATE_FILE" ]; then
@@ -380,8 +362,10 @@ show_status() {
     fi
     echo
     echo "Protected original backup:"
-    if [ -d "$ORIG_BACKUP_DIR" ]; then
+    if [ -f "$ORIG_BACKUP_DIR/status.php" ]; then
         echo "$ORIG_BACKUP_DIR"
+    elif [ -d "$ORIG_BACKUP_DIR" ]; then
+        echo "$ORIG_BACKUP_DIR (directory exists but status.php is missing)"
     else
         echo "(not created yet)"
     fi
@@ -433,4 +417,29 @@ main_menu() {
 }
 
 need_root
-main_menu
+case "${1:-menu}" in
+    apply)
+        backup_files
+        patch_status_php
+        log "Protected original backup: $ORIG_BACKUP_DIR"
+        log "Per-run backup: $RUN_BACKUP_DIR"
+        log "DMR state file: $STATE_FILE"
+        log "Refresh the DVSwitch Dashboard in the browser."
+        log "Log file: $LOG_FILE"
+        ;;
+    restore-latest)
+        restore_latest_backup
+        log "Log file: $LOG_FILE"
+        ;;
+    restore-original|restore-factory)
+        restore_original
+        log "Log file: $LOG_FILE"
+        ;;
+    status)
+        show_status | tee -a "$LOG_FILE"
+        log "Log file: $LOG_FILE"
+        ;;
+    menu|*)
+        main_menu
+        ;;
+esac
