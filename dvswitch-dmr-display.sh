@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.4-test"
+VERSION="v0.4.5-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -63,11 +63,11 @@ from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
 
-if "DVS-DMR-DISPLAY-CLEANUP v0.4.4-test" in text:
-    print("status.php already contains v0.4.4 marker")
+if "DVS-DMR-DISPLAY-CLEANUP v0.4.5-test" in text:
+    print("status.php already contains v0.4.5 marker")
     sys.exit(0)
 
-block = r'''// DVS-DMR-DISPLAY-CLEANUP v0.4.4-test
+block = r'''// DVS-DMR-DISPLAY-CLEANUP v0.4.5-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state is updated ONLY when ABInfo reports ambe_mode=DMR.
 // Non-DMR modes keep showing the last valid DMR network/TG/name.
@@ -257,18 +257,18 @@ old_block_re = re.compile(
 )
 
 # Case 1: upgrade/replace an existing DMR display cleanup helper block.
-new_text, count = old_block_re.subn(block, text, count=1)
+new_text, count = old_block_re.subn(lambda m: block, text, count=1)
 if count == 1:
     path.write_text(new_text)
-    print("Replaced existing DMR display helper block with v0.4.4")
+    print("Replaced existing DMR display helper block with v0.4.5")
     sys.exit(0)
 
 # Case 2: clean/factory status.php or restored original: insert the helper block
 # immediately before the stock PHP close + Status label anchor.
-new_text, count = anchor_re.subn(block + "\n\n?>\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>", text, count=1)
+new_text, count = anchor_re.subn(lambda m: block + "\n\n?>\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>", text, count=1)
 if count == 1:
     path.write_text(new_text)
-    print("Inserted DMR display helper block v0.4.4 before Status label")
+    print("Inserted DMR display helper block v0.4.5 before Status label")
     sys.exit(0)
 
 print("Could not find the stock Status label anchor in status.php")
