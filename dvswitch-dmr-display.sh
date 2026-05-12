@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.5-test"
+VERSION="v0.4.6-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -63,11 +63,11 @@ from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
 
-if "DVS-DMR-DISPLAY-CLEANUP v0.4.5-test" in text:
-    print("status.php already contains v0.4.5 marker")
+if "DVS-DMR-DISPLAY-CLEANUP v0.4.6-test" in text:
+    print("status.php already contains v0.4.6 marker")
     sys.exit(0)
 
-block = r'''// DVS-DMR-DISPLAY-CLEANUP v0.4.5-test
+block = r'''// DVS-DMR-DISPLAY-CLEANUP v0.4.6-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state is updated ONLY when ABInfo reports ambe_mode=DMR.
 // Non-DMR modes keep showing the last valid DMR network/TG/name.
@@ -87,6 +87,18 @@ if (!function_exists('dvs_dmr_display_network_key')) {
         if (strpos($s, 'DMR+') !== false || strpos($s, 'DMRPLUS') !== false || strpos($s, 'DMR PLUS') !== false) { return 'DMR+'; }
         if (strpos($s, 'SYSTEM X') !== false || strpos($s, 'SYSTEMX') !== false) { return 'SystemX'; }
         return 'DMR';
+    }
+}
+
+if (!function_exists('dvs_dmr_display_safe_master')) {
+    function dvs_dmr_display_safe_master() {
+        if (function_exists('getDMRMaster')) {
+            $master = getDMRMaster();
+            if (is_string($master) && trim($master) !== '') {
+                return trim($master);
+            }
+        }
+        return '';
     }
 }
 
@@ -256,19 +268,54 @@ old_block_re = re.compile(
     re.S
 )
 
+def patch_visible_rows(src):
+    mode_php = "<?php echo dvs_dmr_display_mode_label((isset($abinfo['tlv']['ambe_mode']) ? $abinfo['tlv']['ambe_mode'] : ''), dvs_dmr_display_safe_master()); ?>"
+    master_php = "<?php echo dvs_dmr_display_master_label(dvs_dmr_display_safe_master(), $abinfo); ?>"
+
+    changes = []
+
+    mode_re = re.compile(r'(<tr>\s*<th[^>]*>\s*Mode\s*</th>\s*<td[^>]*>).*?(</td>\s*</tr>)', re.S | re.I)
+    src, n = mode_re.subn(lambda m: m.group(1) + mode_php + m.group(2), src, count=1)
+    if n:
+        changes.append('Mode row')
+
+    # Stock DVSwitch commonly renders DMR Master as a header row followed by a single value row.
+    master_re = re.compile(r'(<tr>\s*<th[^>]*>\s*DMR\s+Master\s*</th>\s*</tr>\s*<tr>\s*<td[^>]*>).*?(</td>\s*</tr>)', re.S | re.I)
+    src, n = master_re.subn(lambda m: m.group(1) + master_php + m.group(2), src, count=1)
+    if n:
+        changes.append('DMR Master value row')
+    else:
+        # Fallback for variants that place label and value in the same row.
+        master_inline_re = re.compile(r'(<tr>\s*<th[^>]*>\s*DMR\s+Master\s*</th>\s*<td[^>]*>).*?(</td>\s*</tr>)', re.S | re.I)
+        src, n = master_inline_re.subn(lambda m: m.group(1) + master_php + m.group(2), src, count=1)
+        if n:
+            changes.append('DMR Master inline row')
+
+    return src, changes
+
 # Case 1: upgrade/replace an existing DMR display cleanup helper block.
 new_text, count = old_block_re.subn(lambda m: block, text, count=1)
 if count == 1:
+    new_text, display_changes = patch_visible_rows(new_text)
     path.write_text(new_text)
-    print("Replaced existing DMR display helper block with v0.4.5")
+    print("Replaced existing DMR display helper block with v0.4.6")
+    if display_changes:
+        print("Patched visible dashboard rows: " + ", ".join(display_changes))
+    else:
+        print("WARNING: Helper block updated, but visible Mode/DMR Master rows were not found")
     sys.exit(0)
 
 # Case 2: clean/factory status.php or restored original: insert the helper block
 # immediately before the stock PHP close + Status label anchor.
 new_text, count = anchor_re.subn(lambda m: block + "\n\n?>\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>", text, count=1)
 if count == 1:
+    new_text, display_changes = patch_visible_rows(new_text)
     path.write_text(new_text)
-    print("Inserted DMR display helper block v0.4.5 before Status label")
+    print("Inserted DMR display helper block v0.4.6 before Status label")
+    if display_changes:
+        print("Patched visible dashboard rows: " + ", ".join(display_changes))
+    else:
+        print("WARNING: Helper block inserted, but visible Mode/DMR Master rows were not found")
     sys.exit(0)
 
 print("Could not find the stock Status label anchor in status.php")
@@ -284,7 +331,7 @@ PY
     }
 
     log "PHP syntax check passed for status.php"
-    log "Patched status.php DMR helper logic: DMR state updates now require ABInfo ambe_mode=DMR."
+    log "Patched status.php DMR helper logic and visible Mode/DMR Master rows."
     log "When mode is YSF/P25/NXDN/STFU/D-Star, the DMR Master box should keep the last valid DMR TG/name."
     log "DMR state file: $STATE_FILE"
 }
@@ -323,7 +370,7 @@ show_status() {
     echo "State file:     $STATE_FILE"
     echo
     echo "Markers in status.php:"
-    grep -n "DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_current_state\|dvs_dmr_display_is_live_dmr\|dvs_dmr_display_state_file" "$STATUS_FILE" 2>/dev/null || true
+    grep -n "DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_current_state\|dvs_dmr_display_is_live_dmr\|dvs_dmr_display_state_file\|dvs_dmr_display_master_label\|dvs_dmr_display_mode_label" "$STATUS_FILE" 2>/dev/null || true
     echo
     echo "Current DMR state file:"
     if [ -f "$STATE_FILE" ]; then
