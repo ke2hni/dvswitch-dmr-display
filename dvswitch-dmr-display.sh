@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.9-test"
+VERSION="v0.4.10-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -81,10 +81,10 @@ path = Path(sys.argv[1])
 text = path.read_text()
 
 HELPER_START = "// DVS-DMR-DISPLAY-CLEANUP"
-NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.9-test"
+NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.10-test"
 
 helper = r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.4.9-test
+// DVS-DMR-DISPLAY-CLEANUP v0.4.10-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state updates ONLY while ABInfo reports ambe_mode=DMR.
 // Non-DMR modes keep showing the last valid DMR network/TG/name.
@@ -256,7 +256,7 @@ helper_pattern = re.compile(
 text, helper_replaced = helper_pattern.subn(lambda m: helper + "\n", text, count=1)
 
 if helper_replaced:
-    print("Replaced existing DMR helper block with v0.4.8")
+    print("Replaced existing DMR helper block with v0.4.10")
 elif NEW_MARKER not in text:
     needle = "include_once dirname(dirname(__FILE__)).'/include/functions.php';\n"
     if needle in text:
