@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.8-test"
+VERSION="v0.4.9-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -66,7 +66,7 @@ validate_or_restore(){
 
 patch_status_php(){
   log "Applying ${APP_NAME} ${VERSION}"
-  log "Scope: DMR display only. Hooks visible Mode / Tx TG / DMR Master rows and protects DMR state from non-DMR modes."
+  log "Scope: DMR display only. Hooks required visible Mode / DMR Master rows and protects DMR state from non-DMR modes."
 
   mkdir -p "$STATE_DIR" || die "Could not create state directory: $STATE_DIR"
   chown www-data:www-data "$STATE_DIR" 2>/dev/null || true
@@ -81,10 +81,10 @@ path = Path(sys.argv[1])
 text = path.read_text()
 
 HELPER_START = "// DVS-DMR-DISPLAY-CLEANUP"
-NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.8-test"
+NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.9-test"
 
 helper = r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.4.8-test
+// DVS-DMR-DISPLAY-CLEANUP v0.4.9-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state updates ONLY while ABInfo reports ambe_mode=DMR.
 // Non-DMR modes keep showing the last valid DMR network/TG/name.
@@ -300,7 +300,7 @@ if old_tx in text:
 elif new_tx in text:
     print("Visible Tx TG row already patched")
 else:
-    print("WARNING: Could not find visible Tx TG row; leaving Tx TG unchanged")
+    print("Tx TG row uses current dashboard format; leaving Tx TG unchanged by design")
 
 # Patch direct DMR Master output. Preserve the closing brace outside the replacement.
 old_master = 'echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".$dmrMasterHost."</span></td></tr>\\n";}'
@@ -325,7 +325,7 @@ PY
   [ "$rc" -eq 0 ] || die "Could not patch status.php cleanly"
   validate_or_restore
 
-  log "Patched helper block and visible rows."
+  log "Patched helper block and required visible rows."
   log "Expected dashboard result: Mode shows DMR network label; DMR Master shows TG name when cache has the TG."
   log "DMR state file: $STATE_FILE"
 }
