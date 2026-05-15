@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.17-test"
+VERSION="v0.4.18-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -298,7 +298,7 @@ import re,sys
 from pathlib import Path
 path=Path(sys.argv[1]); text=path.read_text()
 helper=r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.4.17-test
+// DVS-DMR-DISPLAY-CLEANUP v0.4.18-test
 // Display-only helpers. No routing/startup config is changed. TG 0 and invalid fallback TG 9 cannot overwrite saved DMR targets.
 if (!function_exists('dvs_dmr_display_state_file')) { function dvs_dmr_display_state_file() { return '/var/lib/mmdvm/cache/dmr_last_state.json'; } }
 if (!function_exists('dvs_dmr_display_targets_file')) { function dvs_dmr_display_targets_file() { return '/var/lib/mmdvm/cache/dmr_last_targets.json'; } }
@@ -319,9 +319,9 @@ if (!function_exists('dvs_dmr_display_master_label')) { function dvs_dmr_display
 '''.strip()+"\n"
 # Remove existing helper block until Status span or include-derived variables.
 pat=re.compile(r"// DVS-DMR-DISPLAY-CLEANUP v[0-9.]+-test\s*.*?(?=\?>\s*\n<span style=\"font-weight: bold;font-size:14px;\">Status</span>|\$dmrMasterHost\s*=)",re.S)
-text,n=pat.subn(helper+"\n",text,count=1)
-if n: print('Replaced existing DMR helper block with v0.4.17')
-elif 'DVS-DMR-DISPLAY-CLEANUP v0.4.17-test' not in text:
+text,n=pat.subn(lambda m: helper+"\n",text,count=1)
+if n: print('Replaced existing DMR helper block with v0.4.18')
+elif 'DVS-DMR-DISPLAY-CLEANUP v0.4.18-test' not in text:
  needle="include_once dirname(dirname(__FILE__)).'/include/functions.php';\n"
  if needle in text:
   text=text.replace(needle,needle+helper+"\n",1); print('Inserted DMR helper block after functions.php include')
@@ -331,11 +331,11 @@ new='echo "<tr><th width=50%>Mode</th><td style=\\"background: #f9f9f9;font-weig
 if old in text: text=text.replace(old,new); print('Patched visible Mode row using exact v0.3 hook')
 elif new in text: print('Visible Mode row already patched')
 else:
- text,c=re.subn(r'echo\s+"<tr><th width=50%>Mode</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">"\s*\.\s*\$abinfo\[\'tlv\'\]\[\'ambe_mode\'\]\s*\.\s*"</td></tr>\\n";',new,text)
+ text,c=re.subn(r'echo\s+"<tr><th width=50%>Mode</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">"\s*\.\s*\$abinfo\[\'tlv\'\]\[\'ambe_mode\'\]\s*\.\s*"</td></tr>\\n";',lambda m: new,text)
  if c: print('Patched visible Mode row using fallback hook')
  else: raise SystemExit('Could not find visible Mode output line')
 newtx='echo "<tr><th width=50%>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#ef7215;\\">".htmlspecialchars(dvs_dmr_display_current_tg($abinfo), ENT_QUOTES, \'UTF-8\')."</td></tr>\\n";'
-text,c=re.subn(r'echo\s+"<tr><th width=50%>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#(?:ef7215|b44010);\\">"\s*\.\s*(?:\$abinfo\[\'digital\'\]\[\'tg\'\]|htmlspecialchars\(dvs_dmr_display_current_tg\(\$abinfo\), ENT_QUOTES, \'UTF-8\'\))\s*\.\s*"</td></tr>\\n";',newtx,text)
+text,c=re.subn(r'echo\s+"<tr><th width=50%>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#(?:ef7215|b44010);\\">"\s*\.\s*(?:\$abinfo\[\'digital\'\]\[\'tg\'\]|htmlspecialchars\(dvs_dmr_display_current_tg\(\$abinfo\), ENT_QUOTES, \'UTF-8\'\))\s*\.\s*"</td></tr>\\n";',lambda m: newtx,text)
 print(f'Patched visible Tx TG row using flexible default-compatible hook ({c} occurrence(s))')
 oldm='echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".$dmrMasterHost."</span></td></tr>\\n";}'
 newm='echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".dvs_dmr_display_master_label($dmrMasterHost, $abinfo)."</span></td></tr>\\n";}'
@@ -343,7 +343,7 @@ if oldm in text: text=text.replace(oldm,newm,1); print('Patched visible DMR Mast
 elif newm in text: print('Visible DMR Master row already patched')
 else:
  repl='echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".dvs_dmr_display_master_label($dmrMasterHost, $abinfo)."</span></td></tr>\\n";'
- text,c=re.subn(r'echo\s+"<tr><td\s+style=\\"background: #ffffed;\\"\s+colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">"\s*\.\s*(?:\$dmrMasterHost|dvs_dmr_display_master_label\(\$dmrMasterHost, \$abinfo\))\s*\.\s*"</span></td></tr>\\n";',repl,text,count=1)
+ text,c=re.subn(r'echo\s+"<tr><td\s+style=\\"background: #ffffed;\\"\s+colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">"\s*\.\s*(?:\$dmrMasterHost|dvs_dmr_display_master_label\(\$dmrMasterHost, \$abinfo\))\s*\.\s*"</span></td></tr>\\n";',lambda m: repl,text,count=1)
  if c: print('Patched visible DMR Master row using fallback hook')
  else: raise SystemExit('Could not find visible DMR Master output line')
 path.write_text(text)
