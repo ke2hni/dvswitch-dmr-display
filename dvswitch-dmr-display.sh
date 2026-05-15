@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.15-test"
+VERSION="v0.4.16-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -15,6 +15,9 @@ LOG_FILE="/root/dvs-dashboard-dmr-display-cleanup-${RUN_ID}.log"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 CACHE_SERVICE_FILE="/etc/systemd/system/dvs-dashboard-dmr-cache-update.service"
 CACHE_TIMER_FILE="/etc/systemd/system/dvs-dashboard-dmr-cache-update.timer"
+RESTORE_HELPER_FILE="/usr/local/sbin/dvs-dashboard-dmr-target-restore"
+RESTORE_SERVICE_FILE="/etc/systemd/system/dvs-dashboard-dmr-target-restore.service"
+RESTORE_TIMER_FILE="/etc/systemd/system/dvs-dashboard-dmr-target-restore.timer"
 
 log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 die(){ log "ERROR: $*"; exit 1; }
@@ -250,6 +253,102 @@ EOF_TIMER
   log "Installed/enabled automatic weekly DMR cache update timer: $CACHE_TIMER_FILE"
 }
 
+install_target_restore_timer(){
+  need_root
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log "systemctl not found; skipping automatic DMR target restore timer install."
+    return 0
+  fi
+
+  cat > "$RESTORE_HELPER_FILE" <<'EOF_RESTORE'
+#!/usr/bin/env python3
+import glob, json, os, re, subprocess, sys, time
+STATE_FILE = '/var/lib/mmdvm/cache/dmr_last_state.json'
+DVS_TUNE = '/opt/MMDVM_Bridge/dvswitch.sh'
+
+def read_json(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f: return json.load(f)
+    except Exception: return {}
+
+def newest_abinfo():
+    paths = glob.glob('/tmp/ABInfo*.json')
+    if not paths: return {}
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return read_json(paths[0])
+
+def get_mode(ab): return str(ab.get('tlv', {}).get('ambe_mode', '')).strip().upper()
+
+def get_tg(ab):
+    tg = str(ab.get('digital', {}).get('tg', '')).strip()
+    if re.fullmatch(r'\d+', tg): return tg
+    last = str(ab.get('last_tune', '')).strip()
+    m = re.fullmatch(r'TG\s*(\d+)', last, re.I)
+    if m: return m.group(1)
+    if re.fullmatch(r'\d+', last): return last
+    return ''
+
+def choose_saved(state):
+    tg = str(state.get('tg', '')).strip()
+    if re.fullmatch(r'\d+', tg) and tg not in ('0', '9'): return tg
+    return ''
+
+def main():
+    saved_tg = choose_saved(read_json(STATE_FILE))
+    if not saved_tg: return 0
+    for _ in range(6):
+        ab = newest_abinfo(); mode = get_mode(ab); live_tg = get_tg(ab)
+        if mode in ('DMR', 'STFU'):
+            if live_tg in ('', '0', '9'):
+                subprocess.run([DVS_TUNE, 'tune', saved_tg], check=False)
+            return 0
+        time.sleep(10)
+    return 0
+if __name__ == '__main__': sys.exit(main())
+EOF_RESTORE
+  chmod 0755 "$RESTORE_HELPER_FILE" || die "Could not chmod $RESTORE_HELPER_FILE"
+
+  cat > "$RESTORE_SERVICE_FILE" <<EOF_SERVICE
+[Unit]
+Description=Restore last valid DVSwitch DMR talkgroup after startup/fallback TG
+After=network-online.target analog_bridge.service mmdvm_bridge.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$RESTORE_HELPER_FILE
+EOF_SERVICE
+
+  cat > "$RESTORE_TIMER_FILE" <<'EOF_TIMER'
+[Unit]
+Description=Run DVSwitch DMR last-talkgroup restore after boot and periodically
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+
+  chmod 0644 "$RESTORE_SERVICE_FILE" "$RESTORE_TIMER_FILE" || true
+  systemctl daemon-reload || die "systemctl daemon-reload failed"
+  systemctl enable --now "$(basename "$RESTORE_TIMER_FILE")" >/dev/null 2>&1 || die "Could not enable DMR target restore timer"
+  log "Installed/enabled automatic DMR last-target restore timer: $RESTORE_TIMER_FILE"
+}
+
+remove_target_restore_timer(){
+  need_root
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "$(basename "$RESTORE_TIMER_FILE")" >/dev/null 2>&1 || true
+    rm -f "$RESTORE_SERVICE_FILE" "$RESTORE_TIMER_FILE" "$RESTORE_HELPER_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log "Removed automatic DMR target restore timer/service/helper if present."
+  fi
+}
+
 remove_cache_timer(){
   need_root
   if command -v systemctl >/dev/null 2>&1; then
@@ -277,10 +376,10 @@ path = Path(sys.argv[1])
 text = path.read_text()
 
 HELPER_START = "// DVS-DMR-DISPLAY-CLEANUP"
-NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.15-test"
+NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.16-test"
 
 helper = r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.4.15-test
+// DVS-DMR-DISPLAY-CLEANUP v0.4.16-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state updates ONLY while ABInfo reports ambe_mode=DMR.
 // Non-DMR modes keep showing the last valid DMR network/TG/name. TG 0 reconnect transients are ignored.
@@ -387,45 +486,72 @@ if (!function_exists('dvs_dmr_display_write_state')) {
     }
 }
 
+if (!function_exists('dvs_dmr_display_network_state')) {
+    function dvs_dmr_display_network_state($stored, $network) {
+        if (!is_array($stored)) { return array(); }
+        if (isset($stored['networks']) && is_array($stored['networks']) && isset($stored['networks'][$network]) && is_array($stored['networks'][$network])) {
+            return $stored['networks'][$network];
+        }
+        if (isset($stored['network']) && strcasecmp((string)$stored['network'], (string)$network) === 0) {
+            return $stored;
+        }
+        return array();
+    }
+}
+
+if (!function_exists('dvs_dmr_display_saved_tg_for_network')) {
+    function dvs_dmr_display_saved_tg_for_network($stored, $network) {
+        $state = dvs_dmr_display_network_state($stored, $network);
+        $tg = isset($state['tg']) ? trim((string)$state['tg']) : '';
+        if ($tg === '' || $tg === '0') { return ''; }
+        return $tg;
+    }
+}
+
+if (!function_exists('dvs_dmr_display_update_network_state')) {
+    function dvs_dmr_display_update_network_state($stored, $network, $tg, $name, $master) {
+        if (!is_array($stored)) { $stored = array(); }
+        if (!isset($stored['networks']) || !is_array($stored['networks'])) { $stored['networks'] = array(); }
+        $entry = array('network' => $network, 'tg' => $tg, 'name' => $name, 'master' => (string)$master, 'updated' => date('c'));
+        $stored['networks'][$network] = $entry;
+        foreach ($entry as $k => $v) { $stored[$k] = $v; }
+        dvs_dmr_display_write_state($stored);
+        return $entry;
+    }
+}
+
 if (!function_exists('dvs_dmr_display_current_state')) {
     function dvs_dmr_display_current_state($dmrMasterHost, $abinfo) {
         $stored = dvs_dmr_display_read_state();
-
-        if (!dvs_dmr_display_is_live_dmr($abinfo)) {
-            return $stored;
-        }
-
+        if (!dvs_dmr_display_is_live_dmr($abinfo)) { return $stored; }
         $network = dvs_dmr_display_network_key($dmrMasterHost, $abinfo);
         $tg = dvs_dmr_display_extract_live_tg($abinfo);
-
-        // During mode changes back into DMR/STFU, ABInfo can briefly report TG 0.
-        // Do not let that transient reconnect value overwrite the last real DMR target.
-        if ($network === 'DMR' || $tg === '' || $tg === '0') {
+        if ($network === 'DMR') { return $stored; }
+        // Ignore transient TG 0 and stock TG 9 fallback when a real saved TG exists for this network.
+        if ($tg === '' || $tg === '0' || $tg === '9') {
+            $saved = dvs_dmr_display_network_state($stored, $network);
+            if (!empty($saved)) { return $saved; }
             return $stored;
         }
-
         $name = dvs_dmr_display_lookup_name($network, $tg);
-        $state = array(
-            'network' => $network,
-            'tg' => $tg,
-            'name' => $name,
-            'master' => (string)$dmrMasterHost,
-            'updated' => date('c')
-        );
-        dvs_dmr_display_write_state($state);
-        return $state;
+        return dvs_dmr_display_update_network_state($stored, $network, $tg, $name, $dmrMasterHost);
     }
 }
 
 if (!function_exists('dvs_dmr_display_current_tg')) {
-    function dvs_dmr_display_current_tg($abinfo) {
-        $state = dvs_dmr_display_read_state();
+    function dvs_dmr_display_current_tg($abinfo, $dmrMasterHost = '') {
+        $stored = dvs_dmr_display_read_state();
+        $network = $dmrMasterHost !== '' ? dvs_dmr_display_network_key($dmrMasterHost, $abinfo) : (isset($stored['network']) ? (string)$stored['network'] : '');
         if (!dvs_dmr_display_is_live_dmr($abinfo)) {
-            return isset($state['tg']) ? trim((string)$state['tg']) : '';
+            $saved = $network !== '' ? dvs_dmr_display_saved_tg_for_network($stored, $network) : '';
+            if ($saved !== '') { return $saved; }
+            return isset($stored['tg']) ? trim((string)$stored['tg']) : '';
         }
         $tg = dvs_dmr_display_extract_live_tg($abinfo);
-        if ($tg === '' || $tg === '0') {
-            return isset($state['tg']) ? trim((string)$state['tg']) : '';
+        if ($tg === '' || $tg === '0' || $tg === '9') {
+            $saved = $network !== '' ? dvs_dmr_display_saved_tg_for_network($stored, $network) : '';
+            if ($saved !== '') { return $saved; }
+            return isset($stored['tg']) ? trim((string)$stored['tg']) : '';
         }
         return $tg;
     }
@@ -509,7 +635,7 @@ else:
 
 # Patch visible Tx TG rows so non-DMR modes show last valid DMR TG instead of wrong-mode target.
 # v0.4.15 never uses a broad helper-exists shortcut; it patches any remaining raw Tx TG output lines.
-new_tx_expr = 'htmlspecialchars(dvs_dmr_display_current_tg($abinfo), ENT_QUOTES, \'UTF-8\')'
+new_tx_expr = 'htmlspecialchars(dvs_dmr_display_current_tg($abinfo, $dmrMasterHost), ENT_QUOTES, \'UTF-8\')'
 tx_pattern = re.compile(
     r'echo\s+"<tr><th(?:\s+width=50%)?>Tx TG</th><td style=\\"background:\s*#f9f9f9;font-weight:\s*bold;color:#[0-9A-Fa-f]{6};\\">"\s*'
     r'\.\s*\$abinfo\[\'digital\'\]\[\'tg\'\]\s*\.\s*"</td></tr>\\n";'
@@ -538,7 +664,7 @@ else:
             patched += 1
     if patched:
         print(f"Patched visible Tx TG row using known-format fallback ({patched} occurrence(s))")
-    elif re.search(r'Tx TG</th><td[^\n]+dvs_dmr_display_current_tg\(\$abinfo\)', text):
+    elif re.search(r'Tx TG</th><td[^\n]+dvs_dmr_display_current_tg\(\$abinfo(?:,\s*\$dmrMasterHost)?\)', text):
         print("Visible Tx TG row already patched")
     else:
         raise SystemExit('Could not find visible Tx TG output line in status.php')
@@ -567,7 +693,7 @@ PY
   validate_or_restore
 
   log "Patched helper block and required visible rows."
-  log "Expected dashboard result: Mode shows DMR network label; DMR Master/Tx TG preserve the last valid DMR TG and ignore transient TG 0."
+  log "Expected dashboard result: Mode shows DMR network label; DMR Master/Tx TG preserve the last valid DMR TG, ignore TG 0/stock TG 9 fallback, and restore last DMR TG after reboot."
   log "DMR state file: $STATE_FILE"
 }
 
@@ -587,6 +713,7 @@ restore_original(){
   log "Restoring protected original dashboard file backup: $ORIG_BACKUP_DIR"
   restore_from_dir "$ORIG_BACKUP_DIR"
   remove_cache_timer
+  remove_target_restore_timer
   validate_or_restore
   log "Restore protected original files completed"
 }
@@ -599,6 +726,7 @@ show_status(){
   echo "TG cache file:  $TG_CACHE_FILE"
   if [ -f "$TG_CACHE_FILE" ]; then echo "TG cache lines: $(grep -vc '^#' "$TG_CACHE_FILE" 2>/dev/null || echo 0)"; else echo "TG cache lines: (cache file missing)"; fi
   echo "State file:     $STATE_FILE"
+  echo "Restore helper: $RESTORE_HELPER_FILE"
   echo
   echo "Markers / visible hooks in status.php:"
   grep -n "DVS-DMR-DISPLAY-CLEANUP\|dvs_dmr_display_mode_label\|dvs_dmr_display_current_tg\|dvs_dmr_display_master_label" "$STATUS_FILE" 2>/dev/null || true
@@ -618,6 +746,7 @@ apply_cleanup(){
   backup_files
   update_cache
   install_cache_timer
+  install_target_restore_timer
   patch_status_php
   log "Protected original backup: $ORIG_BACKUP_DIR"
   log "Per-run backup: $RUN_BACKUP_DIR"
