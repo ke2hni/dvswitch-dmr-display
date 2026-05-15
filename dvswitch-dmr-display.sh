@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.10-test"
+VERSION="v0.4.11-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -81,10 +81,10 @@ path = Path(sys.argv[1])
 text = path.read_text()
 
 HELPER_START = "// DVS-DMR-DISPLAY-CLEANUP"
-NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.10-test"
+NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.11-test"
 
 helper = r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.4.10-test
+// DVS-DMR-DISPLAY-CLEANUP v0.4.11-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state updates ONLY while ABInfo reports ambe_mode=DMR.
 // Non-DMR modes keep showing the last valid DMR network/TG/name.
@@ -256,7 +256,7 @@ helper_pattern = re.compile(
 text, helper_replaced = helper_pattern.subn(lambda m: helper + "\n", text, count=1)
 
 if helper_replaced:
-    print("Replaced existing DMR helper block with v0.4.10")
+    print("Replaced existing DMR helper block with v0.4.11")
 elif NEW_MARKER not in text:
     needle = "include_once dirname(dirname(__FILE__)).'/include/functions.php';\n"
     if needle in text:
@@ -292,15 +292,41 @@ else:
         raise SystemExit('Could not find visible Mode output line in status.php')
 
 # Patch visible Tx TG row so non-DMR modes show last valid DMR TG instead of wrong-mode target.
-old_tx = 'echo "<tr><th>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">".$abinfo[\'digital\'][\'tg\']."</td></tr>\\n";'
-new_tx = 'echo "<tr><th>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">".htmlspecialchars(dvs_dmr_display_current_tg($abinfo), ENT_QUOTES, \'UTF-8\')."</td></tr>\\n";'
-if old_tx in text:
-    text = text.replace(old_tx, new_tx, 1)
-    print("Patched visible Tx TG row using exact hook")
-elif new_tx in text:
+# v0.4.11 supports both older updated dashboards and fresh/default DVSwitch dashboards.
+new_tx_expr = 'htmlspecialchars(dvs_dmr_display_current_tg($abinfo), ENT_QUOTES, \'UTF-8\')'
+if 'dvs_dmr_display_current_tg($abinfo)' in text:
     print("Visible Tx TG row already patched")
 else:
-    print("Tx TG row uses current dashboard format; leaving Tx TG unchanged by design")
+    tx_pattern = re.compile(
+        r'echo\s+"<tr><th(?:\s+width=50%)?>Tx TG</th><td style=\\"background:\s*#f9f9f9;font-weight:\s*bold;color:#[0-9A-Fa-f]{6};\\">"\s*'
+        r'\.\s*\$abinfo\[\'digital\'\]\[\'tg\'\]\s*\.\s*"</td></tr>\\n";'
+    )
+    def tx_repl(match):
+        line = match.group(0)
+        return re.sub(
+            r'\$abinfo\[\'digital\'\]\[\'tg\'\]',
+            new_tx_expr,
+            line,
+            count=1
+        )
+    text, n = tx_pattern.subn(tx_repl, text, count=2)
+    if n:
+        print(f"Patched visible Tx TG row using flexible default-compatible hook ({n} occurrence(s))")
+    else:
+        # Conservative fallback for exact known formats.
+        known_tx_lines = [
+            'echo "<tr><th>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#b44010;\\">".$abinfo[\'digital\'][\'tg\']."</td></tr>\\n";',
+            'echo "<tr><th width=50%>Tx TG</th><td style=\\"background: #f9f9f9;font-weight: bold;color:#ef7215;\\">".$abinfo[\'digital\'][\'tg\']."</td></tr>\\n";',
+        ]
+        patched = 0
+        for old_tx in known_tx_lines:
+            if old_tx in text:
+                text = text.replace(old_tx, old_tx.replace("$abinfo['digital']['tg']", new_tx_expr), 1)
+                patched += 1
+        if patched:
+            print(f"Patched visible Tx TG row using known-format fallback ({patched} occurrence(s))")
+        else:
+            raise SystemExit('Could not find visible Tx TG output line in status.php')
 
 # Patch direct DMR Master output. Preserve the closing brace outside the replacement.
 old_master = 'echo "<tr><td  style=\\"background: #ffffed;\\" colspan=\\"2\\"><span style=\\"color:#b5651d;font-weight: bold\\">".$dmrMasterHost."</span></td></tr>\\n";}'
