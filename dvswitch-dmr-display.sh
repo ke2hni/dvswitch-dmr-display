@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="v0.4.13-test"
+VERSION="v0.4.14-test"
 APP_NAME="DVSwitch Dashboard DMR Display Cleanup"
 DVS_ROOT="/usr/share/dvswitch"
 STATUS_FILE="${DVS_ROOT}/include/status.php"
@@ -134,7 +134,7 @@ def add(network, tg, name):
     rows.append((network, tg, name))
 
 def fetch(url, timeout=20):
-    req = urllib.request.Request(url, headers={'User-Agent': 'dvs-dashboard-dmr-display-cache/0.4.13'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'dvs-dashboard-dmr-display-cache/0.4.14'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode('utf-8', 'replace')
 
@@ -277,13 +277,13 @@ path = Path(sys.argv[1])
 text = path.read_text()
 
 HELPER_START = "// DVS-DMR-DISPLAY-CLEANUP"
-NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.13-test"
+NEW_MARKER = "// DVS-DMR-DISPLAY-CLEANUP v0.4.14-test"
 
 helper = r'''
-// DVS-DMR-DISPLAY-CLEANUP v0.4.13-test
+// DVS-DMR-DISPLAY-CLEANUP v0.4.14-test
 // Display-only helpers. No tuning, routing, startup TG, or network config is changed.
 // DMR state updates ONLY while ABInfo reports ambe_mode=DMR.
-// Non-DMR modes keep showing the last valid DMR network/TG/name.
+// Non-DMR modes keep showing the last valid DMR network/TG/name. TG 0 reconnect transients are ignored.
 if (!function_exists('dvs_dmr_display_state_file')) {
     function dvs_dmr_display_state_file() {
         return '/var/lib/mmdvm/cache/dmr_last_state.json';
@@ -398,7 +398,9 @@ if (!function_exists('dvs_dmr_display_current_state')) {
         $network = dvs_dmr_display_network_key($dmrMasterHost, $abinfo);
         $tg = dvs_dmr_display_extract_live_tg($abinfo);
 
-        if ($network === 'DMR' || $tg === '') {
+        // During mode changes back into DMR/STFU, ABInfo can briefly report TG 0.
+        // Do not let that transient reconnect value overwrite the last real DMR target.
+        if ($network === 'DMR' || $tg === '' || $tg === '0') {
             return $stored;
         }
 
@@ -417,11 +419,15 @@ if (!function_exists('dvs_dmr_display_current_state')) {
 
 if (!function_exists('dvs_dmr_display_current_tg')) {
     function dvs_dmr_display_current_tg($abinfo) {
+        $state = dvs_dmr_display_read_state();
         if (!dvs_dmr_display_is_live_dmr($abinfo)) {
-            $state = dvs_dmr_display_read_state();
             return isset($state['tg']) ? trim((string)$state['tg']) : '';
         }
-        return dvs_dmr_display_extract_live_tg($abinfo);
+        $tg = dvs_dmr_display_extract_live_tg($abinfo);
+        if ($tg === '' || $tg === '0') {
+            return isset($state['tg']) ? trim((string)$state['tg']) : '';
+        }
+        return $tg;
     }
 }
 
@@ -466,7 +472,7 @@ helper_pattern = re.compile(
 text, helper_replaced = helper_pattern.subn(lambda m: helper + "\n", text, count=1)
 
 if helper_replaced:
-    print("Replaced existing DMR helper block with v0.4.12")
+    print("Replaced existing DMR helper block with v0.4.14")
 elif NEW_MARKER not in text:
     needle = "include_once dirname(dirname(__FILE__)).'/include/functions.php';\n"
     if needle in text:
@@ -562,7 +568,7 @@ PY
   validate_or_restore
 
   log "Patched helper block and required visible rows."
-  log "Expected dashboard result: Mode shows DMR network label; DMR Master shows TG name when cache has the TG."
+  log "Expected dashboard result: Mode shows DMR network label; DMR Master/Tx TG preserve the last valid DMR TG and ignore transient TG 0."
   log "DMR state file: $STATE_FILE"
 }
 
