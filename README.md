@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/DVSwitch-DMR%20Display%20Cleanup-blueviolet?style=for-the-badge">
-  <img src="https://img.shields.io/badge/Version-v0.3--test-brightgreen?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Version-v0.4.11--test-brightgreen?style=for-the-badge">
   <img src="https://img.shields.io/badge/Debian%2013-Trixie-red?style=for-the-badge&logo=debian">
   <img src="https://img.shields.io/badge/ASL3-Compatible-success?style=for-the-badge">
 </p>
@@ -74,7 +74,7 @@ sudo ./dvswitch-dmr-display.sh
 ## 📋 Menu
 
 ```text
-DVSwitch Dashboard DMR Display Cleanup v0.3-test
+DVSwitch Dashboard DMR Display Cleanup v0.4.11-test
 
 1 = Apply DMR display cleanup, build cache, and install weekly cache updater
 2 = Restore latest per-run backup
